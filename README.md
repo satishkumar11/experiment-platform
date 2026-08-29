@@ -36,7 +36,6 @@ app/
 static/
   index.html       demo page
 DESIGN.md
-requirement.txt        original assignment brief
 ```
 
 ## Setup (local)
@@ -103,4 +102,8 @@ Deployed on [Render](https://render.com) (or Railway) as a single web service, w
    - Environment variables: `DATABASE_URL`, `ANTHROPIC_API_KEY`
 4. Tables are created automatically on startup (`Base.metadata.create_all`).
 
-Live URL: _add after deploying_
+**Live URL:** <https://experiment-platform-x18h.onrender.com>
+
+**Demo page:** <https://experiment-platform-x18h.onrender.com/> — creates an experiment, simulates a visitor (assign → expose → convert), and shows live results.
+
+Hosted on Render's free tier, so the instance spins down after ~15 minutes of inactivity — the first request after a period of idleness can take 50+ seconds to wake it up. Subsequent requests are fast. No credentials are required to exercise the API; all endpoints are open.

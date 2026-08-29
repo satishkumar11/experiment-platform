@@ -5,5 +5,6 @@ venv/
 .venv/
 *.db
 .typo-ai/
+.claude/
 designapproach.txt
 requirement.txt
