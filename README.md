@@ -2,7 +2,7 @@
 
 A small backend for running A/B tests. It answers one question on every page load — "which variant should this visitor see?" — and later reports which variant is winning.
 
-This was built for a take-home assignment. [DESIGN.md](DESIGN.md) has the actual reasoning behind the decisions here, and it's the part that matters most — this README is just setup and reference.
+[DESIGN.md](DESIGN.md) has the reasoning behind the decisions here — this README is just setup and reference.
 
 ## What's here
 
