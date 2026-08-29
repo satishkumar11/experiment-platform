@@ -21,36 +21,36 @@
   <h1>Experiment Platform — Demo</h1>
   <p class="muted">Create an experiment, then simulate a visitor being assigned a variant, exposed, and converted.</p>
 
-  <h2>1. Create an experiment</h2>
-  <label>Name</label>
+  <h2 title="Define the experiment's variants and how traffic should be split between them.">1. Create an experiment</h2>
+  <label for="exp-name" title="A short identifier for this experiment, e.g. 'homepage-headline'. Doesn't need to be unique, just descriptive.">Name</label>
   <input id="exp-name" value="homepage-headline" />
-  <label>Variants (JSON)</label>
+  <label for="exp-variants" title="Each variant needs a key and a weight (weights across all variants must add up to 100). Add &quot;is_ai_generated&quot;: true to a variant to have its content written by an LLM when you click Create — the prompt and fallback_content fields only apply to those.">Variants (JSON)</label>
   <textarea id="exp-variants" rows="8">[
   { "key": "control", "weight": 50, "content": "Welcome to our site!" },
   { "key": "ai_variant", "weight": 50, "is_ai_generated": true,
     "prompt": "Write a short, punchy homepage headline for a productivity app.",
     "fallback_content": "Get more done, every day." }
 ]</textarea>
-  <button onclick="createExperiment()">Create experiment</button>
+  <button onclick="createExperiment()" title="Creates the experiment and, for any AI-flagged variant, calls the LLM once to generate its content.">Create experiment</button>
   <pre id="create-out"></pre>
 
-  <h2>2. Simulate a visitor</h2>
-  <label>Experiment ID</label>
+  <h2 title="Pretend to be a visitor: get assigned a variant, then optionally convert.">2. Simulate a visitor</h2>
+  <label for="assign-exp-id" title="The experiment to assign this visitor to. Auto-filled after you create one above.">Experiment ID</label>
   <input id="assign-exp-id" />
-  <label>Visitor ID</label>
+  <label for="visitor-id" title="A stable ID for this visitor. The same visitor ID always gets the same variant for a given experiment — try reusing one to see stickiness in action.">Visitor ID</label>
   <input id="visitor-id" />
-  <button onclick="randomVisitor()">Random visitor</button>
-  <button onclick="assignVisitor()">Assign + Expose</button>
+  <button onclick="randomVisitor()" title="Fills in a random visitor ID, as if a new person showed up.">Random visitor</button>
+  <button onclick="assignVisitor()" title="Calls GET /assign to pick this visitor's variant, then POST /expose to record that they saw it.">Assign + Expose</button>
   <div id="variant-box" class="variant-box" style="display:none">
     <div id="variant-content"></div>
-    <button onclick="convertVisitor()">Convert this visitor</button>
+    <button onclick="convertVisitor()" title="Calls POST /convert to record that this visitor completed the goal, credited to the variant they were shown.">Convert this visitor</button>
     <div id="convert-out" class="muted"></div>
   </div>
 
-  <h2>3. Results</h2>
-  <label>Experiment ID</label>
+  <h2 title="See how each variant is performing so far.">3. Results</h2>
+  <label for="results-exp-id" title="The experiment to view results for.">Experiment ID</label>
   <input id="results-exp-id" />
-  <button onclick="loadResults()">Load results</button>
+  <button onclick="loadResults()" title="Fetches exposures, conversions, and conversion rate per variant.">Load results</button>
   <table id="results-table" style="display:none">
     <thead><tr><th>Variant</th><th>Exposures</th><th>Conversions</th><th>Conv. rate</th></tr></thead>
     <tbody id="results-body"></tbody>
