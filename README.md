@@ -15,6 +15,28 @@ This was built for a take-home assignment. [DESIGN.md](DESIGN.md) has the actual
 
 What I left out on purpose (auth, adaptive allocation, a real event queue, proper statistical significance) is explained in the design doc, not silently missing.
 
+## How it works
+
+```mermaid
+flowchart TD
+    A["Someone defines an experiment<br/>POST /experiments"] --> DB[(Postgres)]
+    A -.->|"if a variant is flagged AI-generated,<br/>happens once, right here"| LLM["Call the LLM"]
+    LLM -.-> DB
+
+    V["Visitor loads the page"] -->|"GET /assign"| CACHE["In-memory config cache<br/>(refreshes from Postgres every 30s)"]
+    CACHE --> HASH["hash(visitor_id + experiment_id)<br/>→ same visitor always lands in the same bucket"]
+    HASH --> VARIANT["Variant to show"]
+
+    VARIANT -->|"POST /expose"| DB
+    VARIANT --> CONVERT{"Visitor converts?"}
+    CONVERT -->|"POST /convert"| DB
+
+    REPORT["Someone checks results<br/>GET /experiments/id/results"] --> DB
+    DB --> RESULT["Exposures, conversions,<br/>conversion rate per variant"]
+```
+
+The important thing this diagram is meant to show: the visitor-facing path (`/assign`) never touches Postgres directly — it only reads the cache. Postgres only comes into play for defining experiments, recording tracking events, and reading results — never for deciding what a visitor sees in the moment.
+
 ## Running it locally
 
 You'll need Python 3.11+ and a Postgres database somewhere (Neon's free tier works fine).
