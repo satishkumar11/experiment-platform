@@ -2,83 +2,58 @@
 
 ## Architecture
 
-The service has four surfaces on top of one Postgres database:
+There are four things this service does: let someone define an experiment, decide which variant a visitor sees, record what happened, and report on it. Under the hood that's one Postgres database and four endpoints — `POST /experiments` for config, `GET /assign` for the hot path, `POST /expose` and `POST /convert` for tracking, and `GET /experiments/{id}/results` for reporting.
 
-- `POST /experiments` — configuration
-- `GET /assign` — the hot path
-- `POST /expose`, `POST /convert` — tracking
-- `GET /experiments/{id}/results` — reporting
+The main decision I made was to treat reads and writes as two different problems, because they actually have different requirements. `/assign` runs on every page load, so it has to be fast and it can't go down — it never touches Postgres directly. Instead, experiment configs (variants and their weights) sit in an in-memory cache that refreshes every 30 seconds, and assignment itself is just a hash function with no I/O at all. Tracking is the opposite: it happens after the page has already rendered, so it's fine for it to be a normal synchronous write to Postgres, and it's even fine if it occasionally fails — you lose a bit of reporting accuracy, not a customer's page.
 
-The key architectural decision is splitting the system into two paths with very different requirements, and making sure they don't share a failure mode:
-
-**The read path (`/assign`)** must be fast and must not go down, because it's on every page render. It never touches Postgres directly. Experiment configuration (variants + weights) is loaded into an in-memory cache (`app/cache.py`) on a 30-second TTL, and `/assign` reads only from that cache. Assignment itself is a pure hash function (`app/assignment.py`) — no I/O, no lock, no database round trip.
-
-**The write path (`/expose`, `/convert`)** is not latency-sensitive in the same way — it fires after the page has already rendered — so it can afford to be a straightforward synchronous write to Postgres with a uniqueness constraint for dedup. It's fine for it to be slower, and even fine for it to occasionally fail, since a lost tracking event degrades reporting accuracy, not the visitor's page.
-
-This split — compute-only reads, durable writes, and no dependency from the former on the latter — is the single idea the rest of the design hangs off.
+That split — assignment as pure computation, tracking as durable writes, and nothing in the fast path depending on the slow one — is really the whole idea the rest of this doc explains.
 
 ## Determinism
 
-Assignment is `bucket = sha256(salt + ":" + experiment_id + ":" + visitor_id) % 10000`, then the bucket is mapped into cumulative weight ranges (e.g., a 50/50 split is buckets `[0, 5000)` and `[5000, 10000)`).
+Assignment works like this: `bucket = sha256(salt + experiment_id + visitor_id) % 10000`, and then that bucket number gets mapped onto cumulative weight ranges. A 50/50 split is just "buckets 0–4999 are A, 5000–9999 are B."
 
-Why this works:
+The nice thing about this is that it's sticky without needing memory. The same three inputs always hash to the same number, so I don't need a database row anywhere saying "visitor X is in variant B" — the function itself is the answer, every time, on every server, even after a restart. SHA-256 also spreads values close to uniformly, so even with only a couple thousand visitors the actual split tracks the configured weights pretty closely (I tested this locally: 2,000 simulated visitors on a 50/50 split came out 986/1014).
 
-- **Sticky by construction, not by memory.** The same three inputs always hash to the same bucket. We don't need to store "visitor X got variant B" anywhere for assignment to be sticky — the function *is* the source of truth. That also means it's correct across server restarts and across horizontally scaled instances with zero coordination between them.
-- **Well-distributed.** SHA-256 output is uniformly distributed, so for any real visitor population the buckets fill close to uniformly; at even a few thousand visitors per experiment, observed splits track the configured weights closely (verified locally: 2,000 simulated visitors on a 50/50 split landed at 986/1014).
-- **Per-experiment salt.** Each experiment stores its own random salt, so a visitor's bucket in one experiment is uncorrelated with their bucket in another — a visitor isn't systematically "always in the top decile" across every experiment on the site.
-- **Stable variant ordering.** Cumulative-weight mapping depends on iterating variants in a fixed order. Variants have an explicit `position` column set at creation time — not the UUID primary key, whose ordering isn't guaranteed to be stable across queries. Getting this wrong silently would have been a real bug: relying on default row order would make bucket boundaries non-deterministic across a schema/driver change.
-- **No storage needed for correctness, storage kept anyway for auditability.** We do store the assignment implicitly the first time a client calls `/expose` (see Correctness below), but that's for reporting, not for computing the answer next time.
+Two smaller details mattered more than I expected. First, each experiment gets its own random salt, so a visitor's bucket in one experiment has nothing to do with their bucket in another — otherwise someone could end up "always in the top 10%" across every test on the site. Second, the variants have to be iterated in a fixed order for the cumulative-weight math to be consistent, and I originally almost let that fall out of the database's default row order, which is not guaranteed to be stable. I added an explicit `position` field instead — a subtle bug like that would have made bucket boundaries quietly shift after something as unrelated as a driver upgrade.
 
 ## Scale
 
-At millions of calls a day, the two paths scale very differently:
+The two paths scale very differently, which is really the point of splitting them. `/assign` is just CPU and a cache read, so it scales horizontally — add more instances, done, since there's nothing shared to coordinate except a cheap periodic config refresh. Tracking writes are where real load actually lands, and that's the first thing I'd change if this needed to handle serious traffic: instead of writing to Postgres synchronously from the request, push the event onto a queue and batch-insert from a consumer. That way the database absorbs bursts instead of rejecting them, and a slow write never becomes a slow HTTP response.
 
-- **`/assign` is pure CPU** (one hash, one loop over a handful of variants) plus a cache lookup. It has no database dependency in the steady state, so it horizontally scales linearly with instance count — add more stateless replicas behind a load balancer, done. The only shared state is the config cache refresh, which is a cheap periodic query (`SELECT * FROM experiments WHERE is_active`), not per-request.
-- **Tracking (`/expose`, `/convert`) is where write load actually lands.** This is the bottleneck at scale, not assignment. At high volume, the next step (explicitly not built here — see Trade-offs) is to stop writing synchronously from the request handler and instead push events onto a queue (SQS/Kafka/Kinesis) and batch-insert from a consumer. That decouples "did the write succeed" from "did the HTTP call return quickly," and lets the database absorb bursts instead of rejecting them.
-- **What I'd cache further:** the experiment config cache already removes the DB from the assignment path; the next lever is caching *results* aggregates (they don't need to be real-time to the second) rather than running `COUNT()` queries against raw event tables once those tables are large — either a periodic rollup table or a materialized view refreshed every minute.
-- **Read/write ratio:** assignment calls vastly outnumber tracking calls (every page view triggers `/assign`; only a fraction of those convert), and tracking in turn outnumbers config changes (`/experiments`) by orders of magnitude. The architecture is built for exactly that shape: the highest-volume path is the cheapest one.
+I'd also expect the results endpoint to become a bottleneck before assignment does, since it currently runs `COUNT()` over raw event tables. That's fine now; at real scale I'd move to a rollup table refreshed every minute or so — results don't need to be accurate to the second.
+
+Worth noting the actual traffic shape here: assignment calls vastly outnumber tracking calls, and tracking calls vastly outnumber config changes. The architecture leans into that — the busiest path is also the cheapest one.
 
 ## Reliability and failure modes
 
-This is the part the task weights most heavily, so to be explicit about each failure mode:
+This is probably the part I thought about the most, since the brief is explicit that this sits on the page-render critical path.
 
-| Failure | Behavior |
-|---|---|
-| Postgres is slow or unreachable, config cache refresh fails | `/assign` keeps serving the last known-good cached config. The failure is logged, not raised. A visitor gets a slightly stale (but still correct and sticky) assignment, not an error. |
-| Postgres is down and the cache has never been populated (cold start during an outage) | `/assign` returns 404 for that experiment. The client-side integration contract is: a 404/error from `/assign` means "render default content," never "block the page." This is a contract the calling website's snippet must honor — worth stating explicitly since it's the actual fail-safe boundary. |
-| An unknown or paused `experiment_id` is requested | 404, same "fall back to default content" contract. |
-| A tracking write (`/expose`, `/convert`) fails | Returns a 5xx to the caller; since these calls happen after render (typically fire-and-forget from the page), this affects reporting completeness, not the visitor's experience. Worth pairing with `sendBeacon`/`keepalive` on the client so the browser doesn't drop the request on page unload. |
-| Duplicate `/expose` calls (double-fire, retry, etc.) | A unique constraint on `(visitor_id, experiment_id)` means the second insert is a no-op, not a double count. Same pattern for `/convert` on `(visitor_id, experiment_id, goal)`. |
+If Postgres gets slow or goes down, the config cache just keeps serving whatever it last had. The refresh failure gets logged, not raised, so a visitor might get a slightly stale config but still a correct, sticky assignment — not an error. If the cache has genuinely never been populated (say, the database was down since the service started), `/assign` returns a 404 for that experiment, and the expectation is that the calling website treats a 404 as "just show the default content," never as something that should block the page. That handoff — what the client does with a failed assignment call — is really the actual fail-safe boundary, so it's worth stating outright rather than assuming.
 
-The overarching default-behavior principle: **when in doubt, the assignment path fails toward "no experiment" rather than toward an error.** A customer's page should never break because our service is unhappy.
+Tracking failures are lower stakes: if `/expose` or `/convert` fails, that's a 5xx to a call the browser is making after the page already rendered, so it costs you some reporting completeness, not the visitor's experience. Duplicate calls (a retry, a double-fire) are handled with a uniqueness constraint on `(visitor_id, experiment_id)` for exposures, so a repeat is just a no-op instead of a double count.
+
+If I had to compress the whole philosophy into one line: when something goes wrong, the assignment path should fail toward "no experiment," never toward an error page.
 
 ## Correctness
 
-- **Assignment correctness** is the determinism argument above: it's a pure function, so it can't drift or disagree with itself.
-- **Counting correctness** relies on crediting a conversion to whatever variant the visitor was actually exposed to, not to whatever `/assign` would return *now* — `/convert` looks up the visitor's existing exposure row and copies its `variant_id`, rather than re-deriving it. This matters if an experiment's config changes mid-flight (e.g., someone tweaks a variant's weight); a stored exposure is a fact about what already happened, and shouldn't retroactively change.
-- **A conversion with no prior exposure is dropped, not guessed.** If `/convert` is called for a visitor+experiment pair that has no exposure row, it's recorded as `ignored` rather than attributed to a variant — attributing it would silently corrupt the numbers.
-- **Statistical validity — the honest gap.** The results endpoint reports raw conversion rate with no confidence interval, no minimum sample size gate, and no correction for repeated peeking. That's a real limitation: with small sample counts, an apparent "B is winning" can easily be noise. In its current form, this dashboard should be read as descriptive, not as a significance test. The cheapest real fix (see Trade-offs) is a minimum-exposures threshold before a variant is allowed to be called a "winner," plus a basic two-proportion z-test alongside the raw rate.
+The determinism argument above covers assignment correctness — it's a pure function, so it can't disagree with itself. Counting correctness is a slightly different problem: when `/convert` fires, it credits the variant the visitor was actually exposed to (by looking up their existing exposure row), not whatever `/assign` would return right now. That matters because experiment configs can change mid-flight, and an exposure is a historical fact that shouldn't retroactively change. If someone calls `/convert` for a visitor who was never exposed, it just gets dropped rather than guessed at — attributing it to something would quietly corrupt the numbers.
+
+Where I'll be honest about a real gap: the results endpoint reports a raw conversion rate with no confidence interval, no minimum sample size, nothing about repeated peeking. With small numbers, "B is winning" can easily just be noise. As it stands, this dashboard should be read as descriptive, not as a significance test. The cheapest fix would be a minimum-exposures gate before calling a winner, plus a basic two-proportion z-test next to the raw number — I just didn't get to it.
 
 ## The LLM decision
 
-The requirement is explicit that the assignment path is latency-sensitive and LLM calls are slow, costly, and can fail — so the constraint was: **the LLM must never be in the request path of `/assign`.**
+The brief is pretty direct about this: the assignment path is latency-sensitive, and LLM calls are slow, costly, and can fail — so the one rule I held to was that the LLM can never sit inside `/assign`.
 
-The call happens exactly once, synchronously, at experiment-creation time (`POST /experiments`, in `app/llm.py`), when a variant is flagged `is_ai_generated`. The generated text is stored in the same `content` column a static variant would use, so `/assign` doesn't know or care whether a variant's copy was written by a person or generated — it just reads a string out of the cache.
+Instead, the call happens exactly once, synchronously, when an experiment is created and a variant is flagged as AI-generated. Whatever comes back gets stored in the same `content` field a normal static variant would use, so by the time `/assign` runs, it has no idea (and doesn't care) whether that string was written by a person or generated — it's just reading a value out of the cache.
 
-Failure handling: if there's no API key configured, or the call raises, or the response is empty, we fall back to a caller-supplied `fallback_content` string (or the plain `content` field, or a hardcoded default) rather than failing experiment creation. An experiment should never fail to be created because an LLM had a bad moment.
+If there's no API key, or the call throws, or it comes back empty, the system falls back to a caller-supplied fallback string rather than failing the whole experiment creation. An LLM having a bad moment shouldn't stop someone from launching a test.
 
-What this deliberately doesn't cover: regenerating content later (e.g., periodically refreshing AI copy, or generating per-segment variants), which would need an async job rather than an inline call — noted below as a next step.
+What I didn't build: any notion of refreshing that content later, or generating different copy per segment. Both are reasonable extensions, but they'd need to be background jobs, not something that happens inline.
 
 ## Trade-offs and next steps
 
-**Deliberately not built**, and why each is a reasonable thing to leave out of a 24-hour core:
+Things I left out on purpose, and why I think that's a reasonable call for a 24-hour core:
 
-- **Auth / multi-tenancy** — every endpoint is open. Fine for a single-tenant demo; a real system needs API keys scoped per site.
-- **Event queue for tracking writes** — `/expose`/`/convert` write synchronously to Postgres. Correct at the scale a single Postgres instance can take, but the first thing to change under real load (see Scale).
-- **Statistical significance testing** — covered honestly above; raw conversion rate only.
-- **Adaptive allocation (bandits)** — traffic split is fixed at experiment creation. A logical next step: shift traffic toward a winning variant over time (Thompson sampling or similar), trading a bit of assignment-path complexity for faster experiments — but it also complicates "deterministic and sticky," since the split itself would now be changing over time, which needs its own care.
-- **Cross-experiment / cross-site learning** — nothing here uses outcomes from one experiment to inform another. That's a genuinely hard, valuable extension (e.g., "headlines with numbers tend to win on this type of page") but is a different, much larger system.
-- **Admin UI** — config is API-only; a minimal UI was explicitly optional in the brief.
-- **Results caching / rollups** — results are computed live via `COUNT()`; fine at current scale, would need a rollup table under real load.
+Auth — every endpoint is open right now, which is fine for a single-tenant demo but obviously not for anything real; a real version needs API keys scoped per site. An event queue for tracking writes — I write straight to Postgres, which is correct at the scale a single instance can handle but is the first thing I'd swap out under real load. Statistical significance testing — already covered above, this is the part I'm least happy leaving out. Adaptive allocation — traffic splits are fixed once an experiment starts; shifting traffic toward a winning variant over time (something like Thompson sampling) is a natural next step, though it does complicate "sticky and deterministic," since the split itself would then be changing. Cross-experiment learning — nothing here carries insight from one experiment into another (e.g. "headlines with numbers tend to win"), which is a genuinely interesting problem but a much bigger system than this one. An admin UI, since the brief said it was optional. And results caching — fine now, would need a rollup table once the event tables get big.
 
-Given more time, in priority order: (1) a minimum-sample-size / basic significance check on results, since shipping a number without any confidence framing is the weakest part of the current system; (2) moving tracking writes off the request path onto a queue; (3) API auth; (4) adaptive allocation.
+If I had another day, in order: I'd add a minimum-sample-size check to results first, since shipping a number with no confidence framing is the weakest part of what's here; then move tracking writes off the request path onto a queue; then add auth; then look at adaptive allocation.

@@ -1,46 +1,23 @@
 # Experiment Platform
 
-A small backend service that answers, on every page load: **"which variant should this visitor see?"** — and later reports which variant is winning.
+A small backend for running A/B tests. It answers one question on every page load — "which variant should this visitor see?" — and later reports which variant is winning.
 
-Built for a take-home assignment. See [DESIGN.md](DESIGN.md) for the architecture and reasoning — that document is the primary deliverable.
+This was built for a take-home assignment. [DESIGN.md](DESIGN.md) has the actual reasoning behind the decisions here, and it's the part that matters most — this README is just setup and reference.
 
-## What's built
+## What's here
 
-- **Assignment** — `GET /assign` — deterministic, sticky, hash-based variant assignment honoring traffic-allocation weights. No database read is required to compute the answer.
-- **Tracking** — `POST /expose`, `POST /convert` — durable, duplicate-safe event recording.
-- **Results** — `GET /experiments/{id}/results` — exposures, conversions, and conversion rate per variant.
-- **Configuration** — `POST /experiments`, `GET /experiments`, `GET /experiments/{id}` — define an experiment's variants and traffic split.
-- **AI-generated variant content** — a variant can be flagged `is_ai_generated`; its copy is generated once, at experiment-creation time, and cached — never on the assignment hot path.
-- **Demo page** — a single static HTML page (`/`) that creates an experiment, simulates a visitor, and shows live results.
+- **Assignment** (`GET /assign`) — sticky, deterministic, hash-based. No database read needed to compute the answer.
+- **Tracking** (`POST /expose`, `POST /convert`) — records what happened, safely handles duplicates.
+- **Results** (`GET /experiments/{id}/results`) — exposures, conversions, and conversion rate per variant.
+- **Config** (`POST /experiments`) — define an experiment's variants and traffic split.
+- **AI-generated variant content** — flag a variant as `is_ai_generated` and its copy gets written by an LLM once, when the experiment is created — never during assignment.
+- **A demo page** at `/` that walks through the whole flow: create an experiment, simulate a visitor, see results.
 
-## What's deliberately not built
+What I left out on purpose (auth, adaptive allocation, a real event queue, proper statistical significance) is explained in the design doc, not silently missing.
 
-See "Trade-offs and next steps" in [DESIGN.md](DESIGN.md) — auth, adaptive/bandit allocation, a real event queue, and statistical-significance testing were left out on purpose, in favor of a small, correct core.
+## Running it locally
 
-## Project structure
-
-```
-app/
-  main.py          FastAPI app, router wiring, static file mount
-  database.py      SQLAlchemy engine/session
-  models.py        Experiment, Variant, Exposure, Conversion
-  schemas.py       Pydantic request/response models
-  assignment.py    the hash-bucket assignment function (the core of the system)
-  cache.py         in-memory experiment config cache, stale-on-failure
-  llm.py           LLM call for AI-generated variant content, with fallback
-  routers/
-    experiments.py /experiments (config)
-    assign.py      /assign
-    track.py       /expose, /convert
-    results.py     /experiments/{id}/results
-static/
-  index.html       demo page
-DESIGN.md
-```
-
-## Setup (local)
-
-Requires Python 3.11+ and a Postgres database (local, Docker, or free-tier hosted).
+You'll need Python 3.11+ and a Postgres database somewhere (Neon's free tier works fine).
 
 ```bash
 python3 -m venv .venv
@@ -48,19 +25,17 @@ source .venv/bin/activate
 pip install -r requirements.txt
 
 cp .env.example .env
-# edit .env: set DATABASE_URL to your Postgres instance,
-# and ANTHROPIC_API_KEY if you want real AI-generated content
-# (without it, AI variants fall back to their static fallback_content)
+# fill in DATABASE_URL, and ANTHROPIC_API_KEY if you want real AI-generated
+# content — without it, AI variants just use their fallback text
 
 uvicorn app.main:app --reload
 ```
 
-Open `http://localhost:8000/` for the demo page, or `http://localhost:8000/docs` for interactive API docs.
+Then open `http://localhost:8000/` for the demo page, or `http://localhost:8000/docs` for interactive API docs.
 
-## API reference
+## API, briefly
 
-### `POST /experiments`
-Create an experiment. Variant weights must sum to 100.
+**`POST /experiments`** — create an experiment. Weights must add up to 100.
 
 ```json
 {
@@ -78,32 +53,44 @@ Create an experiment. Variant weights must sum to 100.
 }
 ```
 
-### `GET /assign?visitor_id={id}&experiment_id={id}`
-Returns the variant this visitor should see. Same `visitor_id` + `experiment_id` always returns the same variant. 404 if the experiment is unknown or inactive — callers should treat that as "show default content," not as an error to surface to the visitor.
+**`GET /assign?visitor_id=...&experiment_id=...`** — same visitor, same experiment, always the same variant back. If the experiment doesn't exist or is paused, this returns 404 — the intended behavior on the caller's side is "just show default content," not "show an error."
 
-### `POST /expose`
-`{ "visitor_id": "...", "experiment_id": "...", "variant_id": "..." }` — record that a visitor saw a variant. Safe to call more than once for the same visitor+experiment.
+**`POST /expose`** — `{ visitor_id, experiment_id, variant_id }`, records that a visitor saw a variant. Safe to call more than once.
 
-### `POST /convert`
-`{ "visitor_id": "...", "experiment_id": "...", "goal": "default" }` — record a conversion, credited to whatever variant that visitor was exposed to.
+**`POST /convert`** — `{ visitor_id, experiment_id, goal }`, records a conversion against whatever variant that visitor actually saw.
 
-### `GET /experiments/{id}/results`
-Per-variant exposures, conversions, and conversion rate.
+**`GET /experiments/{id}/results`** — per-variant exposures, conversions, conversion rate.
 
-## Deployment
+## Where the code lives
 
-Deployed on [Render](https://render.com) (or Railway) as a single web service, with a managed Postgres instance (e.g. [Neon](https://neon.tech)).
+```text
+app/
+  main.py          FastAPI app, wiring everything together
+  database.py      SQLAlchemy engine/session
+  models.py        Experiment, Variant, Exposure, Conversion
+  schemas.py       request/response models
+  assignment.py    the hash-bucket function — the actual core of the system
+  cache.py         in-memory experiment config cache, stays stale rather than fails
+  llm.py           the one place the LLM gets called, with a fallback
+  routers/         one file per group of endpoints
+static/
+  index.html       the demo page
+DESIGN.md
+```
+
+## Live version
+
+**Service:** <https://experiment-platform-x18h.onrender.com>
+**Demo:** same URL, at `/` — creates an experiment, simulates a visitor, shows results.
+
+No login or API key needed to try it. It's on Render's free tier, so if it's been sitting idle for a while the first request can take 30–50 seconds to wake back up — that's normal, not broken.
+
+## Deploying your own copy
 
 1. Push this repo to GitHub.
-2. Create a Postgres database (Neon/Supabase/Render Postgres) and copy its connection string.
-3. Create a new Render Web Service from the repo:
-   - Build command: `pip install -r requirements.txt`
-   - Start command: `uvicorn app.main:app --host 0.0.0.0 --port $PORT`
-   - Environment variables: `DATABASE_URL`, `ANTHROPIC_API_KEY`
-4. Tables are created automatically on startup (`Base.metadata.create_all`).
-
-**Live URL:** <https://experiment-platform-x18h.onrender.com>
-
-**Demo page:** <https://experiment-platform-x18h.onrender.com/> — creates an experiment, simulates a visitor (assign → expose → convert), and shows live results.
-
-Hosted on Render's free tier, so the instance spins down after ~15 minutes of inactivity — the first request after a period of idleness can take 50+ seconds to wake it up. Subsequent requests are fast. No credentials are required to exercise the API; all endpoints are open.
+2. Spin up a Postgres database (Neon, Supabase, whatever) and grab its connection string.
+3. Create a Render web service pointed at the repo:
+   - Build: `pip install -r requirements.txt`
+   - Start: `uvicorn app.main:app --host 0.0.0.0 --port $PORT`
+   - Env vars: `DATABASE_URL`, `ANTHROPIC_API_KEY`
+4. That's it — tables get created automatically the first time it starts up.
